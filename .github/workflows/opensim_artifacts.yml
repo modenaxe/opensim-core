@@ -32,6 +32,9 @@ on:
     branches: ['*']
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
 
   # ── 1. Build opensim-core and discover plugin directories ──────────────────
@@ -206,6 +209,8 @@ jobs:
         BUILD_DIR=/tmp/plugin_build_${{ matrix.plugin }}
         ARTIFACTS_DIR=$GITHUB_WORKSPACE/plugin_libs
         mkdir -p "$ARTIFACTS_DIR"
+        # *.so for Linux; *.dylib / *.dll included so this step works unchanged
+        # if the workflow is extended to macOS or Windows in the future.
         find "$BUILD_DIR" -maxdepth 3 \
           \( -name "*.so" -o -name "*.dylib" -o -name "*.dll" \) \
           ! -path "*/CMakeFiles/*" \
