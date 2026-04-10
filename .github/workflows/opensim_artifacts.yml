@@ -96,7 +96,7 @@ jobs:
 
     - name: Configure opensim-core
       run: |
-        mkdir -p ~/opensim_build
+        New-Item -ItemType Directory -Force -Path ~/opensim_build | Out-Null
         chdir ~/opensim_build
         cmake -E env CXXFLAGS="/MD" cmake $env:GITHUB_WORKSPACE `
           -G "Visual Studio 17 2022" -A x64 `
