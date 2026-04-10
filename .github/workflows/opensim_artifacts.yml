@@ -1,0 +1,570 @@
+# GitHub Actions workflow: build opensim-core artifacts with incremental caching
+# and compile every plugin found under OpenSim/Examples/Plugins as an individual
+# artifact.
+#
+# Incremental build strategy
+# ──────────────────────────
+# * External dependencies (Simbody, ezc3d …) are cached by the hash of the
+#   dependencies/ sub-tree; they are only rebuilt when that tree changes.
+# * The opensim-core CMake build directory is cached using the commit SHA as
+#   the primary key and a prefix restore-key as fallback.  On a new commit the
+#   most-recent cached build is restored so MSBuild / make only recompiles
+#   changed translation units.  Re-running the exact same commit is a
+#   zero-work rebuild.
+#
+# Plugin discovery
+# ────────────────
+# Every direct sub-directory of OpenSim/Examples/Plugins/ that contains a
+# CMakeLists.txt is built as an independent parallel matrix job and its shared
+# library (.dll / .so / .dylib) is uploaded as a separate artifact.
+#
+# To add your own plugin: drop a folder with a valid CMakeLists.txt (using
+#   find_package(OpenSim REQUIRED PATHS "${OPENSIM_INSTALL_DIR}"))
+# anywhere inside OpenSim/Examples/Plugins/ – the workflow picks it up
+# automatically on the next run.
+#
+# Platform support
+# ────────────────
+# Windows is currently active.  Ubuntu and macOS variants are provided below
+# as commented-out jobs; uncomment the relevant pair (build-opensim-* and
+# build-plugins-*) to enable those platforms.
+
+name: opensim-artifacts
+
+on:
+  push:
+    branches: ['*']
+    tags: ['*']
+  pull_request:
+    branches: ['*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+
+  # ╔══════════════════════════════════════════════════════════════════════════╗
+  # ║  WINDOWS  (active)                                                       ║
+  # ╚══════════════════════════════════════════════════════════════════════════╝
+
+  # ── 1-win. Build opensim-core and discover plugin directories ─────────────
+  build-opensim-windows:
+    name: Build OpenSim Core (Windows)
+    runs-on: windows-2025
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      plugins: ${{ steps.discover.outputs.plugins }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    # ── External dependencies (Simbody, ezc3d …) ────────────────────────────
+    - name: Cache opensim dependencies
+      id: cache-deps
+      uses: actions/cache@v4
+      with:
+        path: ~/opensim_deps_install
+        key: ${{ runner.os }}-opensim-deps-${{ hashFiles('dependencies/**') }}
+        restore-keys: ${{ runner.os }}-opensim-deps-
+
+    - name: Build opensim dependencies
+      if: steps.cache-deps.outputs.cache-hit != 'true'
+      run: |
+        mkdir $env:GITHUB_WORKSPACE\build_deps
+        chdir $env:GITHUB_WORKSPACE\build_deps
+        cmake -E env CXXFLAGS="/W0 /MD" cmake $env:GITHUB_WORKSPACE/dependencies `
+          -G "Visual Studio 17 2022" -A x64 `
+          -DCMAKE_INSTALL_PREFIX=~/opensim_deps_install `
+          -DSUPERBUILD_ezc3d=ON
+        cmake --build . --config Release -- /maxcpucount:4
+
+    # ── opensim-core: incremental build cache ───────────────────────────────
+    # Primary key  = exact commit SHA → zero-work rebuild when re-running the
+    #                                   same commit.
+    # Restore-key  = OS prefix        → on a new commit the most-recent build
+    #                                   is restored; MSBuild recompiles only
+    #                                   what changed.
+    - name: Cache opensim-core build directory
+      id: cache-build
+      uses: actions/cache@v4
+      with:
+        path: ~/opensim_build
+        key: ${{ runner.os }}-opensim-core-build-${{ github.sha }}
+        restore-keys: ${{ runner.os }}-opensim-core-build-
+
+    - name: Configure opensim-core
+      run: |
+        mkdir -p ~/opensim_build
+        chdir ~/opensim_build
+        cmake -E env CXXFLAGS="/MD" cmake $env:GITHUB_WORKSPACE `
+          -G "Visual Studio 17 2022" -A x64 `
+          -DCMAKE_INSTALL_PREFIX=~/opensim_install `
+          -DOPENSIM_DEPENDENCIES_DIR=~/opensim_deps_install `
+          -DOPENSIM_C3D_PARSER=ezc3d `
+          -DOPENSIM_WITH_CASADI=OFF `
+          -DBUILD_PYTHON_WRAPPING=OFF `
+          -DBUILD_JAVA_WRAPPING=OFF `
+          -DOPENSIM_INSTALL_UNIX_FHS=OFF
+
+    - name: Build and install opensim-core
+      run: |
+        chdir ~/opensim_build
+        cmake --build . --config Release --target install -- /maxcpucount:4
+
+    - name: Get opensim version
+      id: version
+      run: |
+        chdir ~/opensim_build
+        $match = cmake -L . | Select-String -Pattern OPENSIM_QUALIFIED_VERSION
+        $version = $match.ToString().Split('=')[1].Trim()
+        echo "version=$version" >> $env:GITHUB_OUTPUT
+
+    # ── Discover plugin directories ──────────────────────────────────────────
+    # Outputs a JSON array of directory names, e.g.:
+    #   ["AnalysisPluginExample","BodyDragExample","CoupledBushingForceExample"]
+    - name: Discover plugins
+      id: discover
+      run: |
+        $base = "$env:GITHUB_WORKSPACE\OpenSim\Examples\Plugins"
+        $names = Get-ChildItem -Path $base -Directory |
+          Where-Object { Test-Path "$($_.FullName)\CMakeLists.txt" } |
+          Select-Object -ExpandProperty Name |
+          Sort-Object
+        # ConvertTo-Json returns a plain string (not an array) for a single item
+        $json = if ($names.Count -eq 1) { "[$(($names | ConvertTo-Json -Compress))]" }
+                else { $names | ConvertTo-Json -Compress }
+        Write-Output "Discovered plugins: $json"
+        "plugins=$json" >> $env:GITHUB_OUTPUT
+
+    # ── Share opensim install with plugin jobs via cache ─────────────────────
+    # Using cache/save (rather than upload-artifact) avoids uploading several
+    # hundred MB and keeps the install at the same absolute path on all runner
+    # instances, which is required because OpenSim's CMake config embeds paths.
+    - name: Save opensim install to cache
+      uses: actions/cache/save@v4
+      with:
+        path: ~/opensim_install
+        key: ${{ runner.os }}-opensim-install-${{ github.sha }}
+
+    # ── Package and upload opensim-core ─────────────────────────────────────
+    - name: Package opensim-core
+      run: |
+        Copy-Item -Path ~/opensim_install `
+          -Destination "$env:GITHUB_WORKSPACE\opensim-core-${{ steps.version.outputs.version }}" `
+          -Recurse
+        chdir $env:GITHUB_WORKSPACE
+        7z a "opensim-core-${{ steps.version.outputs.version }}-win.zip" `
+             "opensim-core-${{ steps.version.outputs.version }}"
+
+    - name: Upload opensim-core artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: opensim-core-${{ steps.version.outputs.version }}-win
+        path: opensim-core-${{ steps.version.outputs.version }}-win.zip
+
+  # ── 2-win. Build each plugin as an independent parallel job ───────────────
+  build-plugins-windows:
+    name: Build Plugin – ${{ matrix.plugin }} (Windows)
+    runs-on: windows-2025
+    needs: build-opensim-windows
+    strategy:
+      matrix:
+        plugin: ${{ fromJson(needs.build-opensim-windows.outputs.plugins) }}
+      fail-fast: false   # one failing plugin does not cancel the others
+
+    steps:
+    - uses: actions/checkout@v4
+
+    # Restore Simbody / ezc3d libraries required at plugin link-time
+    - name: Restore opensim dependencies
+      uses: actions/cache/restore@v4
+      with:
+        path: ~/opensim_deps_install
+        key: ${{ runner.os }}-opensim-deps-${{ hashFiles('dependencies/**') }}
+        restore-keys: ${{ runner.os }}-opensim-deps-
+
+    # Restore the opensim install produced by build-opensim-windows in this run
+    - name: Restore opensim install
+      uses: actions/cache/restore@v4
+      with:
+        path: ~/opensim_install
+        key: ${{ runner.os }}-opensim-install-${{ github.sha }}
+        fail-on-cache-miss: true
+
+    - name: Build plugin ${{ matrix.plugin }}
+      run: |
+        $pluginDir = "$env:GITHUB_WORKSPACE\OpenSim\Examples\Plugins\${{ matrix.plugin }}"
+        $buildDir  = "$env:TEMP\plugin_build_${{ matrix.plugin }}"
+        New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
+        chdir $buildDir
+        cmake $pluginDir `
+          -G "Visual Studio 17 2022" -A x64 `
+          -DOPENSIM_INSTALL_DIR=~/opensim_install
+        cmake --build . --config Release -- /maxcpucount:4
+
+    - name: Collect DLLs
+      run: |
+        $buildDir     = "$env:TEMP\plugin_build_${{ matrix.plugin }}"
+        $artifactsDir = "$env:GITHUB_WORKSPACE\plugin_libs"
+        New-Item -ItemType Directory -Force -Path $artifactsDir | Out-Null
+        Get-ChildItem -Path $buildDir -Recurse -Filter "*.dll" |
+          Where-Object { $_.FullName -notmatch "CMakeFiles" } |
+          Copy-Item -Destination $artifactsDir
+        Write-Output "Built plugin DLLs:"
+        Get-ChildItem $artifactsDir
+
+    - name: Upload plugin artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: plugin-${{ matrix.plugin }}-win
+        path: plugin_libs\
+        if-no-files-found: warn
+
+
+  # ╔══════════════════════════════════════════════════════════════════════════╗
+  # ║  LINUX – Ubuntu 22.04  (commented out)                                   ║
+  # ║  To enable: uncomment the two jobs below and remove the Windows jobs     ║
+  # ║  above, or keep both to build on all platforms simultaneously.           ║
+  # ╚══════════════════════════════════════════════════════════════════════════╝
+
+  # build-opensim-linux:
+  #   name: Build OpenSim Core (Ubuntu 22.04)
+  #   runs-on: ubuntu-22.04
+  #
+  #   outputs:
+  #     version: ${{ steps.version.outputs.version }}
+  #     plugins: ${{ steps.discover.outputs.plugins }}
+  #
+  #   steps:
+  #   - uses: actions/checkout@v4
+  #
+  #   - name: Install system packages
+  #     run: |
+  #       sudo apt-get update
+  #       sudo apt-get install --yes \
+  #         build-essential libtool autoconf pkg-config gfortran \
+  #         libopenblas-dev liblapack-dev freeglut3-dev libxi-dev libxmu-dev
+  #
+  #   - name: Cache opensim dependencies
+  #     id: cache-deps
+  #     uses: actions/cache@v4
+  #     with:
+  #       path: ~/opensim_deps_install
+  #       key: ${{ runner.os }}-opensim-deps-${{ hashFiles('dependencies/**') }}
+  #       restore-keys: ${{ runner.os }}-opensim-deps-
+  #
+  #   - name: Build opensim dependencies
+  #     if: steps.cache-deps.outputs.cache-hit != 'true'
+  #     run: |
+  #       mkdir -p $GITHUB_WORKSPACE/../build_deps
+  #       cd $GITHUB_WORKSPACE/../build_deps
+  #       cmake $GITHUB_WORKSPACE/dependencies \
+  #         -DCMAKE_INSTALL_PREFIX=~/opensim_deps_install \
+  #         -DCMAKE_BUILD_TYPE=Release \
+  #         -DSUPERBUILD_ezc3d=ON
+  #       make --jobs 4
+  #
+  #   - name: Cache opensim-core build directory
+  #     id: cache-build
+  #     uses: actions/cache@v4
+  #     with:
+  #       path: ~/opensim_build
+  #       key: ${{ runner.os }}-opensim-core-build-${{ github.sha }}
+  #       restore-keys: ${{ runner.os }}-opensim-core-build-
+  #
+  #   - name: Configure opensim-core
+  #     run: |
+  #       mkdir -p ~/opensim_build
+  #       cd ~/opensim_build
+  #       cmake $GITHUB_WORKSPACE \
+  #         -DCMAKE_INSTALL_PREFIX=~/opensim_install \
+  #         -DCMAKE_BUILD_TYPE=Release \
+  #         -DOPENSIM_DEPENDENCIES_DIR=~/opensim_deps_install \
+  #         -DOPENSIM_C3D_PARSER=ezc3d \
+  #         -DOPENSIM_WITH_CASADI=OFF \
+  #         -DBUILD_PYTHON_WRAPPING=OFF \
+  #         -DBUILD_JAVA_WRAPPING=OFF \
+  #         -DOPENSIM_INSTALL_UNIX_FHS=OFF
+  #
+  #   - name: Build and install opensim-core
+  #     run: |
+  #       cd ~/opensim_build
+  #       make --jobs 4 install
+  #
+  #   - name: Get opensim version
+  #     id: version
+  #     run: |
+  #       VERSION=$(cmake -L ~/opensim_build \
+  #         | grep OPENSIM_QUALIFIED_VERSION | cut -d'=' -f2)
+  #       echo "version=$VERSION" >> $GITHUB_OUTPUT
+  #
+  #   - name: Discover plugins
+  #     id: discover
+  #     run: |
+  #       plugins=$(
+  #         find $GITHUB_WORKSPACE/OpenSim/Examples/Plugins \
+  #              -mindepth 1 -maxdepth 1 -type d \
+  #              -exec sh -c '[ -f "$1/CMakeLists.txt" ] && basename "$1"' _ {} \; \
+  #         | sort \
+  #         | jq -Rsc 'split("\n") | map(select(. != ""))'
+  #       )
+  #       echo "Discovered plugins: $plugins"
+  #       echo "plugins=$plugins" >> $GITHUB_OUTPUT
+  #
+  #   - name: Save opensim install to cache
+  #     uses: actions/cache/save@v4
+  #     with:
+  #       path: ~/opensim_install
+  #       key: ${{ runner.os }}-opensim-install-${{ github.sha }}
+  #
+  #   - name: Package opensim-core
+  #     run: |
+  #       cp -r ~/opensim_install \
+  #         $GITHUB_WORKSPACE/opensim-core-${{ steps.version.outputs.version }}
+  #       cd $GITHUB_WORKSPACE
+  #       zip --symlinks --recurse-paths --quiet \
+  #         opensim-core-${{ steps.version.outputs.version }}-ubuntu22.zip \
+  #         opensim-core-${{ steps.version.outputs.version }}
+  #
+  #   - name: Upload opensim-core artifact
+  #     uses: actions/upload-artifact@v4
+  #     with:
+  #       name: opensim-core-${{ steps.version.outputs.version }}-ubuntu22
+  #       path: opensim-core-${{ steps.version.outputs.version }}-ubuntu22.zip
+
+  # build-plugins-linux:
+  #   name: Build Plugin – ${{ matrix.plugin }} (Linux)
+  #   runs-on: ubuntu-22.04
+  #   needs: build-opensim-linux
+  #   strategy:
+  #     matrix:
+  #       plugin: ${{ fromJson(needs.build-opensim-linux.outputs.plugins) }}
+  #     fail-fast: false
+  #
+  #   steps:
+  #   - uses: actions/checkout@v4
+  #
+  #   - name: Install system packages
+  #     run: |
+  #       sudo apt-get update
+  #       sudo apt-get install --yes \
+  #         build-essential libopenblas-dev freeglut3-dev libxi-dev libxmu-dev
+  #
+  #   - name: Restore opensim dependencies
+  #     uses: actions/cache/restore@v4
+  #     with:
+  #       path: ~/opensim_deps_install
+  #       key: ${{ runner.os }}-opensim-deps-${{ hashFiles('dependencies/**') }}
+  #       restore-keys: ${{ runner.os }}-opensim-deps-
+  #
+  #   - name: Restore opensim install
+  #     uses: actions/cache/restore@v4
+  #     with:
+  #       path: ~/opensim_install
+  #       key: ${{ runner.os }}-opensim-install-${{ github.sha }}
+  #       fail-on-cache-miss: true
+  #
+  #   - name: Build plugin ${{ matrix.plugin }}
+  #     run: |
+  #       PLUGIN_DIR=$GITHUB_WORKSPACE/OpenSim/Examples/Plugins/${{ matrix.plugin }}
+  #       BUILD_DIR=/tmp/plugin_build_${{ matrix.plugin }}
+  #       mkdir -p "$BUILD_DIR"
+  #       cd "$BUILD_DIR"
+  #       cmake "$PLUGIN_DIR" \
+  #         -DCMAKE_BUILD_TYPE=Release \
+  #         -DOPENSIM_INSTALL_DIR=~/opensim_install
+  #       make --jobs 4
+  #
+  #   - name: Collect shared libraries
+  #     run: |
+  #       BUILD_DIR=/tmp/plugin_build_${{ matrix.plugin }}
+  #       ARTIFACTS_DIR=$GITHUB_WORKSPACE/plugin_libs
+  #       mkdir -p "$ARTIFACTS_DIR"
+  #       find "$BUILD_DIR" -maxdepth 3 -name "*.so" \
+  #         ! -path "*/CMakeFiles/*" \
+  #         -exec cp {} "$ARTIFACTS_DIR/" \;
+  #       echo "Built plugin libraries:"
+  #       ls -la "$ARTIFACTS_DIR/"
+  #
+  #   - name: Upload plugin artifact
+  #     uses: actions/upload-artifact@v4
+  #     with:
+  #       name: plugin-${{ matrix.plugin }}-ubuntu22
+  #       path: plugin_libs/
+  #       if-no-files-found: warn
+
+
+  # ╔══════════════════════════════════════════════════════════════════════════╗
+  # ║  macOS  (commented out)                                                  ║
+  # ║  To enable: uncomment the two jobs below and remove the Windows jobs     ║
+  # ║  above, or keep both to build on all platforms simultaneously.           ║
+  # ╚══════════════════════════════════════════════════════════════════════════╝
+
+  # build-opensim-mac:
+  #   name: Build OpenSim Core (macOS)
+  #   runs-on: macos-15
+  #
+  #   outputs:
+  #     version: ${{ steps.version.outputs.version }}
+  #     plugins: ${{ steps.discover.outputs.plugins }}
+  #
+  #   steps:
+  #   - uses: actions/checkout@v4
+  #
+  #   - name: Install Homebrew packages
+  #     run: |
+  #       brew install pkgconfig autoconf libtool automake wget pcre
+  #       brew reinstall gcc
+  #       mkdir gfortran_version
+  #       gfortran -v &> gfortran_version/gfortran_version.txt
+  #
+  #   - name: Cache opensim dependencies
+  #     id: cache-deps
+  #     uses: actions/cache@v4
+  #     with:
+  #       path: ~/opensim_deps_install
+  #       # Include gfortran version in key because IPOPT links against it.
+  #       key: ${{ runner.os }}-opensim-deps-${{ hashFiles('dependencies/**') }}-${{ hashFiles('gfortran_version/*') }}
+  #       restore-keys: ${{ runner.os }}-opensim-deps-
+  #
+  #   - name: Build opensim dependencies
+  #     if: steps.cache-deps.outputs.cache-hit != 'true'
+  #     run: |
+  #       mkdir -p $GITHUB_WORKSPACE/../build_deps
+  #       cd $GITHUB_WORKSPACE/../build_deps
+  #       cmake $GITHUB_WORKSPACE/dependencies \
+  #         -DCMAKE_INSTALL_PREFIX=~/opensim_deps_install \
+  #         -DCMAKE_BUILD_TYPE=Release \
+  #         -DSUPERBUILD_ezc3d=ON \
+  #         -DCMAKE_OSX_DEPLOYMENT_TARGET=11
+  #       make --jobs 4
+  #
+  #   - name: Cache opensim-core build directory
+  #     id: cache-build
+  #     uses: actions/cache@v4
+  #     with:
+  #       path: ~/opensim_build
+  #       key: ${{ runner.os }}-opensim-core-build-${{ github.sha }}
+  #       restore-keys: ${{ runner.os }}-opensim-core-build-
+  #
+  #   - name: Configure opensim-core
+  #     run: |
+  #       mkdir -p ~/opensim_build
+  #       cd ~/opensim_build
+  #       cmake $GITHUB_WORKSPACE \
+  #         -DCMAKE_INSTALL_PREFIX=~/opensim_install \
+  #         -DCMAKE_BUILD_TYPE=Release \
+  #         -DOPENSIM_DEPENDENCIES_DIR=~/opensim_deps_install \
+  #         -DOPENSIM_C3D_PARSER=ezc3d \
+  #         -DOPENSIM_WITH_CASADI=OFF \
+  #         -DBUILD_PYTHON_WRAPPING=OFF \
+  #         -DBUILD_JAVA_WRAPPING=OFF \
+  #         -DOPENSIM_INSTALL_UNIX_FHS=OFF \
+  #         -DCMAKE_OSX_DEPLOYMENT_TARGET=11
+  #
+  #   - name: Build and install opensim-core
+  #     run: |
+  #       cd ~/opensim_build
+  #       make --jobs 4 install
+  #
+  #   - name: Get opensim version
+  #     id: version
+  #     run: |
+  #       VERSION=$(cmake -L ~/opensim_build \
+  #         | grep OPENSIM_QUALIFIED_VERSION | cut -d'=' -f2)
+  #       echo "version=$VERSION" >> $GITHUB_OUTPUT
+  #
+  #   - name: Discover plugins
+  #     id: discover
+  #     run: |
+  #       plugins=$(
+  #         find $GITHUB_WORKSPACE/OpenSim/Examples/Plugins \
+  #              -mindepth 1 -maxdepth 1 -type d \
+  #              -exec sh -c '[ -f "$1/CMakeLists.txt" ] && basename "$1"' _ {} \; \
+  #         | sort \
+  #         | jq -Rsc 'split("\n") | map(select(. != ""))'
+  #       )
+  #       echo "Discovered plugins: $plugins"
+  #       echo "plugins=$plugins" >> $GITHUB_OUTPUT
+  #
+  #   - name: Save opensim install to cache
+  #     uses: actions/cache/save@v4
+  #     with:
+  #       path: ~/opensim_install
+  #       key: ${{ runner.os }}-opensim-install-${{ github.sha }}
+  #
+  #   - name: Package opensim-core
+  #     run: |
+  #       cp -r ~/opensim_install \
+  #         $GITHUB_WORKSPACE/opensim-core-${{ steps.version.outputs.version }}
+  #       cd $GITHUB_WORKSPACE
+  #       zip --symlinks --recurse-paths --quiet \
+  #         opensim-core-${{ steps.version.outputs.version }}-mac.zip \
+  #         opensim-core-${{ steps.version.outputs.version }}
+  #
+  #   - name: Upload opensim-core artifact
+  #     uses: actions/upload-artifact@v4
+  #     with:
+  #       name: opensim-core-${{ steps.version.outputs.version }}-mac
+  #       path: opensim-core-${{ steps.version.outputs.version }}-mac.zip
+
+  # build-plugins-mac:
+  #   name: Build Plugin – ${{ matrix.plugin }} (macOS)
+  #   runs-on: macos-15
+  #   needs: build-opensim-mac
+  #   strategy:
+  #     matrix:
+  #       plugin: ${{ fromJson(needs.build-opensim-mac.outputs.plugins) }}
+  #     fail-fast: false
+  #
+  #   steps:
+  #   - uses: actions/checkout@v4
+  #
+  #   - name: Install Homebrew packages
+  #     run: brew install pkgconfig autoconf libtool automake wget pcre
+  #
+  #   - name: Restore opensim dependencies
+  #     uses: actions/cache/restore@v4
+  #     with:
+  #       path: ~/opensim_deps_install
+  #       key: ${{ runner.os }}-opensim-deps-${{ hashFiles('dependencies/**') }}
+  #       restore-keys: ${{ runner.os }}-opensim-deps-
+  #
+  #   - name: Restore opensim install
+  #     uses: actions/cache/restore@v4
+  #     with:
+  #       path: ~/opensim_install
+  #       key: ${{ runner.os }}-opensim-install-${{ github.sha }}
+  #       fail-on-cache-miss: true
+  #
+  #   - name: Build plugin ${{ matrix.plugin }}
+  #     run: |
+  #       PLUGIN_DIR=$GITHUB_WORKSPACE/OpenSim/Examples/Plugins/${{ matrix.plugin }}
+  #       BUILD_DIR=/tmp/plugin_build_${{ matrix.plugin }}
+  #       mkdir -p "$BUILD_DIR"
+  #       cd "$BUILD_DIR"
+  #       cmake "$PLUGIN_DIR" \
+  #         -DCMAKE_BUILD_TYPE=Release \
+  #         -DOPENSIM_INSTALL_DIR=~/opensim_install \
+  #         -DCMAKE_OSX_DEPLOYMENT_TARGET=11
+  #       make --jobs 4
+  #
+  #   - name: Collect shared libraries
+  #     run: |
+  #       BUILD_DIR=/tmp/plugin_build_${{ matrix.plugin }}
+  #       ARTIFACTS_DIR=$GITHUB_WORKSPACE/plugin_libs
+  #       mkdir -p "$ARTIFACTS_DIR"
+  #       find "$BUILD_DIR" -maxdepth 3 -name "*.dylib" \
+  #         ! -path "*/CMakeFiles/*" \
+  #         -exec cp {} "$ARTIFACTS_DIR/" \;
+  #       echo "Built plugin libraries:"
+  #       ls -la "$ARTIFACTS_DIR/"
+  #
+  #   - name: Upload plugin artifact
+  #     uses: actions/upload-artifact@v4
+  #     with:
+  #       name: plugin-${{ matrix.plugin }}-mac
+  #       path: plugin_libs/
+  #       if-no-files-found: warn
